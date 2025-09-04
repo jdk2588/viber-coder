@@ -1,0 +1,19 @@
+/* Hide "For You" tab on X/Twitter */
+a[href="/home"],
+a[data-testid="AppTabBar_Home_Link"],
+[data-testid="primaryNavigation"] a[href="/home"],
+nav a[href="/home"],
+a[aria-label*="Home"] {
+  display: none !important;
+}
+
+/* Additional selectors for different Twitter UI versions */
+[role="tablist"] [role="tab"]:first-child,
+[data-testid="ScrollSnap-List"] > div:first-child {
+  display: none !important;
+}
+
+/* Hide specific text content */
+*:contains("For you") {
+  display: none !important;
+}
