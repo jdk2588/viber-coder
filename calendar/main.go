@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -19,6 +22,7 @@ type model struct {
 	styles styleSet
 	state  calendarState
 	width  int
+	picker pickerState
 }
 
 const (
@@ -27,6 +31,42 @@ const (
 	maxColumns      = 4
 	defaultColumns  = 3
 )
+
+type pickerType int
+
+const (
+	pickerNone pickerType = iota
+	pickerYear
+	pickerMonth
+)
+
+type pickerState struct {
+	active      pickerType
+	yearCursor  int
+	monthCursor int
+	yearBuffer  string
+	monthBuffer string
+}
+
+func (p *pickerState) openYear(year int) {
+	p.active = pickerYear
+	p.yearCursor = year
+	p.yearBuffer = ""
+	p.monthBuffer = ""
+}
+
+func (p *pickerState) openMonth(month time.Month) {
+	p.active = pickerMonth
+	p.monthCursor = int(month) - 1
+	p.monthBuffer = ""
+	p.yearBuffer = ""
+}
+
+func (p *pickerState) close() {
+	p.active = pickerNone
+	p.yearBuffer = ""
+	p.monthBuffer = ""
+}
 
 func initialModel() model {
 	now := time.Now()
@@ -49,6 +89,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 	case tea.KeyMsg:
+		if handlePickerInput(&m, msg) {
+			break
+		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
@@ -71,10 +114,111 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "t", "T":
 			now := time.Now()
 			m.state.year, m.state.month, m.state.day = now.Year(), now.Month(), now.Day()
+		case "y", "Y":
+			if m.picker.active == pickerYear {
+				m.picker.close()
+			} else {
+				m.picker.openYear(m.state.year)
+			}
+		case "m", "M":
+			if m.picker.active == pickerMonth {
+				m.picker.close()
+			} else {
+				m.picker.openMonth(m.state.month)
+			}
 		}
 	}
 	clampDay(&m.state)
 	return m, nil
+}
+
+func handlePickerInput(m *model, msg tea.KeyMsg) bool {
+	if m.picker.active == pickerNone {
+		return false
+	}
+
+	switch msg.Type {
+	case tea.KeyRunes:
+		if len(msg.Runes) > 0 {
+			switch m.picker.active {
+			case pickerYear:
+				handleYearRunes(&m.picker, msg.Runes)
+			case pickerMonth:
+				handleMonthRunes(&m.picker, msg.Runes)
+			}
+		}
+		return true
+	}
+
+	switch msg.String() {
+	case "backspace", "ctrl+h":
+		switch m.picker.active {
+		case pickerYear:
+			if m.picker.yearBuffer != "" {
+				m.picker.yearBuffer = trimLastRune(m.picker.yearBuffer)
+				if val, err := strconv.Atoi(m.picker.yearBuffer); err == nil {
+					m.picker.yearCursor = val
+				}
+			}
+		case pickerMonth:
+			if m.picker.monthBuffer != "" {
+				m.picker.monthBuffer = trimLastRune(m.picker.monthBuffer)
+				if val, err := strconv.Atoi(m.picker.monthBuffer); err == nil {
+					if val >= 1 && val <= 12 {
+						m.picker.monthCursor = val - 1
+					}
+				}
+			}
+		}
+		return true
+	case "esc":
+		m.picker.close()
+		return true
+	case "enter":
+		switch m.picker.active {
+		case pickerYear:
+			m.state.year = m.picker.yearCursor
+		case pickerMonth:
+			m.state.month = time.Month(m.picker.monthCursor + 1)
+		}
+		m.picker.close()
+		return true
+	case "up", "k":
+		if m.picker.active == pickerYear {
+			m.picker.yearCursor--
+			m.picker.yearBuffer = ""
+		} else if m.picker.active == pickerMonth {
+			m.picker.monthCursor = (m.picker.monthCursor + 11) % 12
+			m.picker.monthBuffer = ""
+		}
+		return true
+	case "down", "j":
+		if m.picker.active == pickerYear {
+			m.picker.yearCursor++
+			m.picker.yearBuffer = ""
+		} else if m.picker.active == pickerMonth {
+			m.picker.monthCursor = (m.picker.monthCursor + 1) % 12
+			m.picker.monthBuffer = ""
+		}
+		return true
+	case "pgup":
+		if m.picker.active == pickerYear {
+			m.picker.yearCursor -= 10
+			m.picker.yearBuffer = ""
+			return true
+		}
+	case "pgdown":
+		if m.picker.active == pickerYear {
+			m.picker.yearCursor += 10
+			m.picker.yearBuffer = ""
+			return true
+		}
+	case "q", "ctrl+c":
+		m.picker.close()
+		return false
+	}
+
+	return true
 }
 
 func (m model) View() string {
@@ -87,6 +231,20 @@ func (m model) View() string {
 	gap := strings.Repeat(" ", monthGapWidth)
 
 	var b strings.Builder
+	b.WriteString(renderControlBar(m.state, m.picker, m.styles))
+	b.WriteString("\n")
+
+	overlay := renderPickerOverlay(m, m.styles)
+	if len(overlay) > 0 {
+		for _, line := range overlay {
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	} else {
+		b.WriteString("\n")
+	}
+
 	for start := 0; start < len(months); start += cols {
 		end := start + cols
 		if end > len(months) {
@@ -104,14 +262,12 @@ func (m model) View() string {
 		}
 	}
 
-	if b.Len() > 0 {
-		b.WriteString("\n\n")
-	}
+	b.WriteString("\n\n")
 
 	selected := fmt.Sprintf("Selected: %04d-%02d-%02d", m.state.year, int(m.state.month), m.state.day)
 	b.WriteString(m.styles.footer.Render(selected))
 	b.WriteString("\n")
-	help := "Arrows/Vim: Move  n/p: Next/Prev month  N/P: Next/Prev year  t: Today  q: Quit"
+	help := "Arrows/Vim: Move  n/p: Next/Prev month  N/P: Next/Prev year  Y/M: Pick year/month (type digits)  t: Today  q: Quit"
 	b.WriteString(m.styles.help.Render(help))
 
 	return b.String()
@@ -200,6 +356,132 @@ func centerText(text string, width int) string {
 	return strings.Repeat(" ", left) + text + strings.Repeat(" ", right)
 }
 
+func renderControlBar(state calendarState, picker pickerState, styles styleSet) string {
+	yearText := fmt.Sprintf("Year [%d]", state.year)
+	monthText := fmt.Sprintf("Month [%s]", state.month.String())
+	yearStyle := styles.control
+	monthStyle := styles.control
+	if picker.active == pickerYear {
+		yearStyle = styles.controlActive
+	}
+	if picker.active == pickerMonth {
+		monthStyle = styles.controlActive
+	}
+	parts := []string{
+		yearStyle.Render(yearText),
+		monthStyle.Render(monthText),
+	}
+	return strings.Join(parts, strings.Repeat(" ", 6))
+}
+
+func renderPickerOverlay(m model, styles styleSet) []string {
+	switch m.picker.active {
+	case pickerYear:
+		lines := renderYearDropdown(m.picker.yearCursor, styles)
+		return append(lines, styles.help.Render("Enter: Apply  Esc: Cancel  Up/Down: Navigate  Type digits"))
+	case pickerMonth:
+		lines := renderMonthDropdown(m.picker.monthCursor, styles)
+		return append(lines, styles.help.Render("Enter: Apply  Esc: Cancel  Up/Down: Navigate  Type digits"))
+	default:
+		return nil
+	}
+}
+
+func renderYearDropdown(cursor int, styles styleSet) []string {
+	const visible = 9
+	start := cursor - visible/2
+	options := make([]int, visible)
+	maxLen := 0
+	for i := 0; i < visible; i++ {
+		year := start + i
+		options[i] = year
+		if l := len(fmt.Sprintf("%d", year)); l > maxLen {
+			maxLen = l
+		}
+	}
+	lines := make([]string, 0, visible)
+	for _, year := range options {
+		label := fmt.Sprintf("%*d", maxLen, year)
+		if year == cursor {
+			lines = append(lines, styles.dropdownCursor.Render(label))
+		} else {
+			lines = append(lines, styles.dropdown.Render(label))
+		}
+	}
+	return lines
+}
+
+func renderMonthDropdown(cursor int, styles styleSet) []string {
+	lines := make([]string, 0, 12)
+	maxLen := 0
+	labels := make([]string, 12)
+	for i := 0; i < 12; i++ {
+		label := fmt.Sprintf("%2d %s", i+1, time.Month(i+1).String())
+		labels[i] = label
+		if len(label) > maxLen {
+			maxLen = len(label)
+		}
+	}
+	for i, label := range labels {
+		padded := padRight(label, maxLen)
+		if i == cursor {
+			lines = append(lines, styles.dropdownCursor.Render(padded))
+		} else {
+			lines = append(lines, styles.dropdown.Render(padded))
+		}
+	}
+	return lines
+}
+
+func padRight(text string, width int) string {
+	if len(text) >= width {
+		return text
+	}
+	return text + strings.Repeat(" ", width-len(text))
+}
+
+func handleYearRunes(p *pickerState, runes []rune) {
+	for _, r := range runes {
+		if unicode.IsDigit(r) || (r == '-' && len(p.yearBuffer) == 0) {
+			p.yearBuffer += string(r)
+		}
+	}
+	if p.yearBuffer == "" {
+		return
+	}
+	if val, err := strconv.Atoi(p.yearBuffer); err == nil {
+		p.yearCursor = val
+	}
+}
+
+func handleMonthRunes(p *pickerState, runes []rune) {
+	for _, r := range runes {
+		if !unicode.IsDigit(r) {
+			continue
+		}
+		p.monthBuffer += string(r)
+		if len(p.monthBuffer) > 2 {
+			p.monthBuffer = p.monthBuffer[len(p.monthBuffer)-2:]
+		}
+	}
+	if p.monthBuffer == "" {
+		return
+	}
+	if val, err := strconv.Atoi(p.monthBuffer); err == nil {
+		if val >= 1 && val <= 12 {
+			p.monthCursor = val - 1
+		}
+	}
+}
+
+func trimLastRune(s string) string {
+	if s == "" {
+		return s
+	}
+	_, size := utf8.DecodeLastRuneInString(s)
+	return s[:len(s)-size]
+}
+
 func main() {
 	if _, err := tea.NewProgram(initialModel()).Run(); err != nil {
 		panic(err)
@@ -248,6 +530,10 @@ type styleSet struct {
 	selectedWeekend lipgloss.Style
 	footer          lipgloss.Style
 	help            lipgloss.Style
+	control         lipgloss.Style
+	controlActive   lipgloss.Style
+	dropdown        lipgloss.Style
+	dropdownCursor  lipgloss.Style
 }
 
 func newStyles() styleSet {
@@ -262,5 +548,9 @@ func newStyles() styleSet {
 		selectedWeekend: base.Copy().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("198")).Bold(true),
 		footer:          base.Copy().Foreground(lipgloss.Color("248")),
 		help:            base.Copy().Foreground(lipgloss.Color("244")),
+		control:         base.Copy().Foreground(lipgloss.Color("153")).Bold(true),
+		controlActive:   base.Copy().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("57")).Bold(true),
+		dropdown:        base.Copy().Padding(0, 1).Foreground(lipgloss.Color("252")),
+		dropdownCursor:  base.Copy().Padding(0, 1).Foreground(lipgloss.Color("230")).Background(lipgloss.Color("57")).Bold(true),
 	}
 }
