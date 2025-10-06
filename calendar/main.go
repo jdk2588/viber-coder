@@ -1,6 +1,7 @@
 package main
 
 import (
+	"calendar/gcal"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,19 +11,39 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"google.golang.org/api/calendar/v3"
 )
 
 type calendarState struct {
-	year  int
-	month time.Month
-	day   int
+	year   int
+	month  time.Month
+	day    int
+	events map[time.Month]map[int][]gcal.Event
 }
 
 type model struct {
-	styles styleSet
-	state  calendarState
-	width  int
-	picker pickerState
+	styles       styleSet
+	state        calendarState
+	width        int
+	picker       pickerState
+	calendarSrv  *calendar.Service
+	eventView    eventViewState
+	calendarView calendarViewState
+	syncing      bool
+	syncError    string
+	config       *gcal.Config
+}
+
+type eventViewState struct {
+	active bool
+	events []gcal.Event
+}
+
+type calendarViewState struct {
+	active    bool
+	calendars []*calendar.CalendarListEntry
+	selected  map[string]bool
+	cursor    int
 }
 
 const (
@@ -70,17 +91,47 @@ func (p *pickerState) close() {
 
 func initialModel() model {
 	now := time.Now()
-	return model{
-		styles: newStyles(),
+
+	config, _ := gcal.LoadConfig()
+	if config == nil {
+		config = &gcal.Config{CalendarIDs: []string{"primary"}}
+	}
+
+	cachedEvents, isFresh := gcal.LoadEventsCache(now.Year())
+	if cachedEvents == nil {
+		cachedEvents = make(map[time.Month]map[int][]gcal.Event)
+	}
+
+	srv, err := gcal.GetCalendarService()
+	syncErr := ""
+
+	if err != nil {
+		syncErr = err.Error()
+	}
+
+	shouldSync := srv != nil && err == nil && !isFresh
+
+	m := model{
+		styles:      newStyles(),
+		calendarSrv: srv,
+		syncError:   syncErr,
+		config:      config,
+		syncing:     shouldSync,
 		state: calendarState{
-			year:  now.Year(),
-			month: now.Month(),
-			day:   now.Day(),
+			year:   now.Year(),
+			month:  now.Month(),
+			day:    now.Day(),
+			events: cachedEvents,
 		},
 	}
+
+	return m
 }
 
 func (m model) Init() tea.Cmd {
+	if m.calendarSrv != nil && m.syncing {
+		return syncEvents(m.calendarSrv, m.config.CalendarIDs, m.state.year)
+	}
 	return nil
 }
 
@@ -89,6 +140,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 	case tea.KeyMsg:
+		if m.eventView.active {
+			if msg.String() == "esc" || msg.String() == "e" || msg.String() == "q" {
+				m.eventView.active = false
+			}
+			return m, nil
+		}
+
+		if m.calendarView.active {
+			if handleCalendarViewInput(&m, msg) {
+				return m, nil
+			}
+		}
+
 		if handlePickerInput(&m, msg) {
 			break
 		}
@@ -109,8 +173,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			adjustMonth(&m.state, -1)
 		case "N":
 			adjustYear(&m.state, 1)
+			if m.state.year != time.Now().Year() {
+				cachedEvents, _ := gcal.LoadEventsCache(m.state.year)
+				if cachedEvents != nil {
+					m.state.events = cachedEvents
+				} else {
+					m.state.events = make(map[time.Month]map[int][]gcal.Event)
+					if m.calendarSrv != nil && !m.syncing {
+						m.syncing = true
+						return m, syncEvents(m.calendarSrv, m.config.CalendarIDs, m.state.year)
+					}
+				}
+			}
 		case "P":
 			adjustYear(&m.state, -1)
+			if m.state.year != time.Now().Year() {
+				cachedEvents, _ := gcal.LoadEventsCache(m.state.year)
+				if cachedEvents != nil {
+					m.state.events = cachedEvents
+				} else {
+					m.state.events = make(map[time.Month]map[int][]gcal.Event)
+					if m.calendarSrv != nil && !m.syncing {
+						m.syncing = true
+						return m, syncEvents(m.calendarSrv, m.config.CalendarIDs, m.state.year)
+					}
+				}
+			}
 		case "t", "T":
 			now := time.Now()
 			m.state.year, m.state.month, m.state.day = now.Year(), now.Month(), now.Day()
@@ -126,10 +214,113 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.picker.openMonth(m.state.month)
 			}
+		case "s", "S":
+			if m.calendarSrv != nil && !m.syncing {
+				m.syncing = true
+				return m, syncEvents(m.calendarSrv, m.config.CalendarIDs, m.state.year)
+			}
+		case "c", "C":
+			if m.calendarSrv != nil && !m.calendarView.active {
+				calendars, err := gcal.ListCalendars(m.calendarSrv)
+				if err == nil {
+					m.calendarView.active = true
+					m.calendarView.calendars = calendars
+					m.calendarView.selected = make(map[string]bool)
+					for _, id := range m.config.CalendarIDs {
+						m.calendarView.selected[id] = true
+					}
+					m.calendarView.cursor = 0
+				}
+			}
+		case "e", "E":
+			if events, ok := m.state.events[m.state.month]; ok {
+				if dayEvents, ok := events[m.state.day]; ok && len(dayEvents) > 0 {
+					m.eventView.active = true
+					m.eventView.events = dayEvents
+				}
+			}
 		}
+	case syncEventsMsg:
+		m.syncing = false
+		if msg.err != nil {
+			m.syncError = fmt.Sprintf("Sync failed: %v", msg.err)
+		} else {
+			if msg.events != nil {
+				m.state.events = msg.events
+				gcal.SaveEventsCache(m.state.year, msg.events)
+			}
+			m.syncError = ""
+		}
+		return m, nil
 	}
 	clampDay(&m.state)
 	return m, nil
+}
+
+type syncEventsMsg struct {
+	events map[time.Month]map[int][]gcal.Event
+	err    error
+}
+
+func syncEvents(srv *calendar.Service, calendarIDs []string, year int) tea.Cmd {
+	return func() tea.Msg {
+		if srv == nil {
+			return syncEventsMsg{events: nil, err: fmt.Errorf("calendar service not initialized")}
+		}
+		if len(calendarIDs) == 0 {
+			return syncEventsMsg{events: make(map[time.Month]map[int][]gcal.Event), err: nil}
+		}
+
+		events, err := gcal.FetchAllMonthsEvents(srv, calendarIDs, year)
+		if err != nil {
+			return syncEventsMsg{events: make(map[time.Month]map[int][]gcal.Event), err: err}
+		}
+		return syncEventsMsg{events: events, err: nil}
+	}
+}
+
+func handleCalendarViewInput(m *model, msg tea.KeyMsg) bool {
+	switch msg.String() {
+	case "esc", "q", "c", "C":
+		m.calendarView.active = false
+		return true
+	case "up", "k":
+		if m.calendarView.cursor > 0 {
+			m.calendarView.cursor--
+		}
+		return true
+	case "down", "j":
+		if m.calendarView.cursor < len(m.calendarView.calendars)-1 {
+			m.calendarView.cursor++
+		}
+		return true
+	case " ", "enter":
+		if m.calendarView.cursor < len(m.calendarView.calendars) {
+			calID := m.calendarView.calendars[m.calendarView.cursor].Id
+			m.calendarView.selected[calID] = !m.calendarView.selected[calID]
+		}
+		return true
+	case "a", "A":
+		newIDs := []string{}
+		for id, selected := range m.calendarView.selected {
+			if selected {
+				newIDs = append(newIDs, id)
+			}
+		}
+		if len(newIDs) == 0 {
+			newIDs = []string{"primary"}
+		}
+		m.config.CalendarIDs = newIDs
+		gcal.SaveConfig(m.config)
+		gcal.ClearEventsCache()
+		m.calendarView.active = false
+		if m.calendarSrv != nil && !m.syncing {
+			m.syncing = true
+			return true
+		}
+		return true
+	}
+	return false
 }
 
 func handlePickerInput(m *model, msg tea.KeyMsg) bool {
@@ -222,6 +413,14 @@ func handlePickerInput(m *model, msg tea.KeyMsg) bool {
 }
 
 func (m model) View() string {
+	if m.eventView.active {
+		return renderEventView(m.eventView.events, m.state, m.styles)
+	}
+
+	if m.calendarView.active {
+		return renderCalendarView(m.calendarView, m.styles)
+	}
+
 	months := make([][]string, 0, 12)
 	for month := time.January; month <= time.December; month++ {
 		months = append(months, renderMonthLines(m.state.year, month, m.state, m.styles))
@@ -267,8 +466,104 @@ func (m model) View() string {
 	selected := fmt.Sprintf("Selected: %04d-%02d-%02d", m.state.year, int(m.state.month), m.state.day)
 	b.WriteString(m.styles.footer.Render(selected))
 	b.WriteString("\n")
-	help := "Arrows/Vim: Move  n/p: Next/Prev month  N/P: Next/Prev year  Y/M: Pick year/month (type digits)  t: Today  q: Quit"
+
+	help := "Arrows/Vim: Move  n/p: Next/Prev month  N/P: Next/Prev year  Y/M: Pick year/month  t: Today  e: View events  s: Sync  c: Calendars  q: Quit"
 	b.WriteString(m.styles.help.Render(help))
+
+	if m.syncing {
+		b.WriteString("\n")
+		b.WriteString(m.styles.controlActive.Render(" ⟳ Syncing with Google Calendar... "))
+	}
+
+	if m.syncError != "" {
+		b.WriteString("\n")
+		b.WriteString(m.styles.help.Render(fmt.Sprintf("Error: %s", m.syncError)))
+	}
+
+	return b.String()
+}
+
+func renderEventView(events []gcal.Event, state calendarState, styles styleSet) string {
+	var b strings.Builder
+
+	title := fmt.Sprintf("Events for %04d-%02d-%02d", state.year, int(state.month), state.day)
+	b.WriteString(styles.header.Render(title))
+	b.WriteString("\n\n")
+
+	if len(events) == 0 {
+		b.WriteString(styles.help.Render("No events for this day"))
+	} else {
+		for i, event := range events {
+			b.WriteString(styles.selectedDay.Render(fmt.Sprintf("  %s  ", event.Summary)))
+			b.WriteString("\n")
+
+			if event.CalendarName != "" && event.CalendarName != event.CalendarID {
+				b.WriteString(styles.help.Render(fmt.Sprintf("  📅 %s", event.CalendarName)))
+				b.WriteString("\n")
+			}
+
+			if event.IsAllDay {
+				b.WriteString(styles.help.Render("  All day"))
+			} else {
+				timeStr := fmt.Sprintf("  %s - %s",
+					event.StartTime.Format("15:04"),
+					event.EndTime.Format("15:04"))
+				b.WriteString(styles.help.Render(timeStr))
+			}
+			b.WriteString("\n")
+
+			if event.Location != "" {
+				b.WriteString(styles.help.Render(fmt.Sprintf("  📍 %s", event.Location)))
+				b.WriteString("\n")
+			}
+
+			if event.Description != "" {
+				desc := event.Description
+				if len(desc) > 100 {
+					desc = desc[:100] + "..."
+				}
+				b.WriteString(styles.help.Render(fmt.Sprintf("  %s", desc)))
+				b.WriteString("\n")
+			}
+
+			if i < len(events)-1 {
+				b.WriteString("\n")
+			}
+		}
+	}
+
+	b.WriteString("\n\n")
+	b.WriteString(styles.help.Render("Press 'e' or 'esc' to return"))
+
+	return b.String()
+}
+
+func renderCalendarView(view calendarViewState, styles styleSet) string {
+	var b strings.Builder
+
+	b.WriteString(styles.header.Render("Select Calendars"))
+	b.WriteString("\n\n")
+	b.WriteString(styles.help.Render("Use ↑/↓ to navigate, Space to toggle, 'a' to apply, 'esc' to cancel"))
+	b.WriteString("\n\n")
+
+	for i, cal := range view.calendars {
+		checkbox := "[ ]"
+		if view.selected[cal.Id] {
+			checkbox = "[✓]"
+		}
+
+		label := fmt.Sprintf("%s %s", checkbox, cal.Summary)
+
+		if i == view.cursor {
+			b.WriteString(styles.selectedDay.Render(fmt.Sprintf("  %s  ", label)))
+		} else {
+			b.WriteString(styles.help.Render(fmt.Sprintf("  %s", label)))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(styles.help.Render("Press 'a' to apply changes, 'esc' to cancel"))
 
 	return b.String()
 }
@@ -312,6 +607,8 @@ func renderMonthLines(year int, month time.Month, state calendarState, styles st
 	firstWeekday := int(time.Date(year, month, 1, 0, 0, 0, 0, time.Local).Weekday())
 	daysInMonth := daysIn(year, month)
 
+	eventsForMonth := state.events[month]
+
 	for week := 0; week < 6; week++ {
 		var weekBuilder strings.Builder
 		for weekday := 0; weekday < 7; weekday++ {
@@ -322,17 +619,25 @@ func renderMonthLines(year int, month time.Month, state calendarState, styles st
 			if index < firstWeekday || currentDay > daysInMonth {
 				text = "  "
 			} else {
+				hasEvents := len(eventsForMonth[currentDay]) > 0
 				text = fmt.Sprintf("%2d", currentDay)
+
 				isWeekend := weekday == 0 || weekday == 6
-				if isWeekend {
-					style = styles.weekend
-				}
+
 				if currentDay == state.day && month == state.month && year == state.year {
 					if isWeekend {
 						style = styles.selectedWeekend
 					} else {
 						style = styles.selectedDay
 					}
+				} else if hasEvents {
+					if isWeekend {
+						style = styles.eventWeekend
+					} else {
+						style = styles.eventDay
+					}
+				} else if isWeekend {
+					style = styles.weekend
 				}
 			}
 			weekBuilder.WriteString(style.Render(text))
@@ -526,6 +831,8 @@ type styleSet struct {
 	weekday         lipgloss.Style
 	day             lipgloss.Style
 	weekend         lipgloss.Style
+	eventDay        lipgloss.Style
+	eventWeekend    lipgloss.Style
 	selectedDay     lipgloss.Style
 	selectedWeekend lipgloss.Style
 	footer          lipgloss.Style
@@ -544,6 +851,8 @@ func newStyles() styleSet {
 		weekday:         base.Copy().Foreground(lipgloss.Color("111")).Bold(true),
 		day:             base.Copy().Foreground(lipgloss.Color("252")),
 		weekend:         base.Copy().Foreground(lipgloss.Color("210")),
+		eventDay:        base.Copy().Foreground(lipgloss.Color("51")).Bold(true),
+		eventWeekend:    base.Copy().Foreground(lipgloss.Color("205")).Bold(true),
 		selectedDay:     base.Copy().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("57")).Bold(true),
 		selectedWeekend: base.Copy().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("198")).Bold(true),
 		footer:          base.Copy().Foreground(lipgloss.Color("248")),
