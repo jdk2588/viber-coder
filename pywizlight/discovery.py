@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from asyncio import AbstractEventLoop, BaseTransport, DatagramTransport, Future
-from typing import Any, List, Optional, Tuple, cast
+from typing import List, Optional, Tuple, cast
 
 from pywizlight import wizlight
 from pywizlight.models import BulbRegistry, DiscoveredBulb
@@ -29,7 +29,7 @@ class BroadcastProtocol(asyncio.DatagramProtocol):
         loop: AbstractEventLoop,
         registry: BulbRegistry,
         broadcast_address: str,
-        future: Future,
+        future: Future[None],
     ) -> None:
         """Init discovery function."""
         self.loop = loop
@@ -63,7 +63,7 @@ class BroadcastProtocol(asyncio.DatagramProtocol):
             _LOGGER.debug("Found bulb with IP: %s and MAC: %s", addr[0], mac)
             self.registry.register(DiscoveredBulb(addr[0], mac))
 
-    def connection_lost(self, exc: Any) -> None:
+    def connection_lost(self, exc: Exception | None) -> None:
         """Return connection error."""
         _LOGGER.debug("Closing UDP discovery")
         if exc is None:
@@ -79,8 +79,8 @@ async def find_wizlights(
     """Start discovery and return list of IPs of the bulbs."""
     registry = BulbRegistry()
     loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    transport, protocol = await loop.create_datagram_endpoint(
+    future: Future[None] = loop.create_future()
+    transport, _ = await loop.create_datagram_endpoint(
         lambda: BroadcastProtocol(loop, registry, broadcast_address, future),
         sock=create_udp_broadcast_socket(PORT),
     )

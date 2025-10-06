@@ -6,21 +6,61 @@ import re
 import threading
 from concurrent.futures import Future, TimeoutError
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
-
-try:
-    import curses
-except ImportError as exc:  # pragma: no cover - platform dependent
-    curses = None  # type: ignore[assignment]
-    _CURSES_IMPORT_ERROR = exc
-else:  # pragma: no cover - platform dependent
-    _CURSES_IMPORT_ERROR = None
+from functools import partial
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Coroutine,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    TypeVar,
+)
 
 from . import discovery, wizlight
 from .bulb import PilotBuilder
 from .scenes import SCENES
 
+try:
+    import curses
+except ImportError as exc:  # pragma: no cover - platform dependent
+    curses = None  # type: ignore[assignment]
+    _curses_import_error = exc
+else:  # pragma: no cover - platform dependent
+    _curses_import_error = None
+
+if TYPE_CHECKING:  # pragma: no cover - typing helper
+
+    class CursesWindow(Protocol):
+        def nodelay(self, flag: bool) -> None: ...
+
+        def keypad(self, flag: bool) -> None: ...
+
+        def getch(self) -> int: ...
+
+        def erase(self) -> None: ...
+
+        def getmaxyx(self) -> Tuple[int, int]: ...
+
+        def refresh(self) -> None: ...
+
+        def addnstr(self, y: int, x: int, text: str, width: int, attr: int) -> None: ...
+
+        def move(self, y: int, x: int) -> None: ...
+
+        def clrtoeol(self) -> None: ...
+
+        def getstr(self, y: int, x: int, n: int) -> bytes: ...
+
+else:
+    CursesWindow = Any
+
 RGBTuple = Tuple[int, int, int]
+
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -41,6 +81,39 @@ class BulbInfo:
         return self.mac or self.ip
 
 
+@dataclass
+class BulbStateUpdate:
+    """Result of a bulb operation, mirroring the Wiz state payload."""
+
+    state: Optional[bool] = None
+    brightness: Optional[int] = None
+    rgb: Optional[RGBTuple] = None
+    scene_id: Optional[int] = None
+    mac: Optional[str] = None
+    error: Optional[str] = None
+
+    @classmethod
+    def empty(cls) -> "BulbStateUpdate":
+        return cls()
+
+    def apply(self, bulb: BulbInfo) -> None:
+        if self.state is not None:
+            bulb.state = bool(self.state)
+        if self.brightness is not None:
+            bulb.brightness = int(self.brightness)
+        if self.rgb is not None:
+            bulb.rgb = (
+                int(self.rgb[0]),
+                int(self.rgb[1]),
+                int(self.rgb[2]),
+            )
+        if self.scene_id is not None:
+            bulb.scene_id = int(self.scene_id)
+        if self.mac:
+            bulb.mac = self.mac
+        bulb.last_error = self.error
+
+
 class WizAsyncController:
     """Manage wizlight coroutines on a dedicated asyncio loop."""
 
@@ -56,7 +129,7 @@ class WizAsyncController:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def _submit(self, coro: Coroutine[Any, Any, Dict[str, Optional[Any]]]) -> Future:
+    def _submit(self, coro: Coroutine[Any, Any, _T]) -> Future[_T]:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def discover(self) -> List[BulbInfo]:
@@ -64,23 +137,23 @@ class WizAsyncController:
         timeout = max(5.0, self.wait_time + 2.0)
         return future.result(timeout=timeout)
 
-    def set_power(self, bulb: BulbInfo, turn_on: bool) -> Dict[str, Optional[Any]]:
+    def set_power(self, bulb: BulbInfo, turn_on: bool) -> BulbStateUpdate:
         future = self._submit(self._set_power(bulb.device, turn_on))
         return future.result(timeout=10.0)
 
-    def set_scene(self, bulb: BulbInfo, scene_id: int) -> Dict[str, Optional[Any]]:
+    def set_scene(self, bulb: BulbInfo, scene_id: int) -> BulbStateUpdate:
         future = self._submit(self._set_scene(bulb.device, scene_id))
         return future.result(timeout=10.0)
 
-    def set_brightness(self, bulb: BulbInfo, brightness: int) -> Dict[str, Optional[Any]]:
+    def set_brightness(self, bulb: BulbInfo, brightness: int) -> BulbStateUpdate:
         future = self._submit(self._set_brightness(bulb.device, brightness))
         return future.result(timeout=10.0)
 
-    def set_rgb(self, bulb: BulbInfo, rgb: RGBTuple) -> Dict[str, Optional[Any]]:
+    def set_rgb(self, bulb: BulbInfo, rgb: RGBTuple) -> BulbStateUpdate:
         future = self._submit(self._set_rgb(bulb.device, rgb))
         return future.result(timeout=10.0)
 
-    def refresh_state(self, bulb: BulbInfo) -> Dict[str, Optional[Any]]:
+    def refresh_state(self, bulb: BulbInfo) -> BulbStateUpdate:
         future = self._submit(self._refresh_state(bulb.device))
         return future.result(timeout=10.0)
 
@@ -119,42 +192,34 @@ class WizAsyncController:
             elif light.mac is None:
                 light.mac = entry.mac_address
 
-            state: Optional[bool] = None
-            brightness: Optional[int] = None
-            rgb: Optional[RGBTuple] = None
-            scene_id: Optional[int] = None
-            error: Optional[str] = None
+            update = BulbStateUpdate.empty()
             try:
                 parser = await light.updateState()
             except Exception as exc:  # pragma: no cover - network dependent
-                error = str(exc)
+                update = BulbStateUpdate(error=str(exc))
                 parser = None
             else:
-                details = self._extract_details(parser)
-                state = details["state"]
-                brightness = details["brightness"]
-                rgb = details["rgb"]
-                scene_id = details["scene_id"]
-                if details["mac"] and light.mac is None:
-                    light.mac = details["mac"]
+                update = self._extract_details(parser)
+                if update.mac and light.mac is None:
+                    light.mac = update.mac
 
             bulbs.append(
                 BulbInfo(
                     device=light,
                     ip=ip,
                     mac=light.mac,
-                    state=state,
-                    brightness=brightness,
-                    rgb=rgb,
-                    scene_id=scene_id,
-                    last_error=error,
+                    state=update.state,
+                    brightness=update.brightness,
+                    rgb=update.rgb,
+                    scene_id=update.scene_id,
+                    last_error=update.error,
                 )
             )
 
         bulbs.sort(key=lambda info: info.ip)
         return bulbs
 
-    async def _set_power(self, device: wizlight, turn_on: bool) -> Dict[str, Optional[Any]]:
+    async def _set_power(self, device: wizlight, turn_on: bool) -> BulbStateUpdate:
         try:
             if turn_on:
                 await device.turn_on()
@@ -162,42 +227,45 @@ class WizAsyncController:
                 await device.turn_off()
             parser = await device.updateState()
         except Exception as exc:  # pragma: no cover - network dependent
-            return {**self._empty_result(), "error": str(exc)}
+            return BulbStateUpdate(error=str(exc))
         details = self._extract_details(parser)
         if parser is None:
-            details["state"] = True if turn_on else False
-        return {**details, "error": None}
+            details.state = True if turn_on else False
+        details.error = None
+        return details
 
-    async def _set_scene(self, device: wizlight, scene_id: int) -> Dict[str, Optional[Any]]:
+    async def _set_scene(self, device: wizlight, scene_id: int) -> BulbStateUpdate:
         builder = PilotBuilder(scene=scene_id, state=True)
         return await self._apply_builder(device, builder)
 
-    async def _set_brightness(self, device: wizlight, brightness: int) -> Dict[str, Optional[Any]]:
+    async def _set_brightness(self, device: wizlight, brightness: int) -> BulbStateUpdate:
         builder = PilotBuilder(brightness=brightness, state=True)
         return await self._apply_builder(device, builder)
 
-    async def _set_rgb(self, device: wizlight, rgb: RGBTuple) -> Dict[str, Optional[Any]]:
+    async def _set_rgb(self, device: wizlight, rgb: RGBTuple) -> BulbStateUpdate:
         builder = PilotBuilder(rgb=rgb, state=True)
         return await self._apply_builder(device, builder)
 
     async def _apply_builder(
         self, device: wizlight, builder: PilotBuilder
-    ) -> Dict[str, Optional[Any]]:
+    ) -> BulbStateUpdate:
         try:
             await device.turn_on(builder)
             parser = await device.updateState()
         except Exception as exc:  # pragma: no cover - network dependent
-            return {**self._empty_result(), "error": str(exc)}
+            return BulbStateUpdate(error=str(exc))
         details = self._extract_details(parser)
-        return {**details, "error": None}
+        details.error = None
+        return details
 
-    async def _refresh_state(self, device: wizlight) -> Dict[str, Optional[Any]]:
+    async def _refresh_state(self, device: wizlight) -> BulbStateUpdate:
         try:
             parser = await device.updateState()
         except Exception as exc:  # pragma: no cover - network dependent
-            return {**self._empty_result(), "error": str(exc)}
+            return BulbStateUpdate(error=str(exc))
         details = self._extract_details(parser)
-        return {**details, "error": None}
+        details.error = None
+        return details
 
     async def _shutdown_lights(self) -> None:
         for light in list(self._lights.values()):
@@ -206,21 +274,13 @@ class WizAsyncController:
         self._lights.clear()
 
     @staticmethod
-    def _empty_result() -> Dict[str, Optional[Any]]:
-        return {
-            "state": None,
-            "brightness": None,
-            "rgb": None,
-            "scene_id": None,
-            "mac": None,
-            "error": None,
-        }
+    def _empty_result() -> BulbStateUpdate:
+        return BulbStateUpdate.empty()
 
     @staticmethod
-    def _extract_details(parser: Optional[Any]) -> Dict[str, Optional[Any]]:
-        details = WizAsyncController._empty_result()
+    def _extract_details(parser: Optional[Any]) -> BulbStateUpdate:
         if parser is None:
-            return details
+            return BulbStateUpdate.empty()
         state = parser.get_state()
         brightness = parser.get_brightness()
         rgb_value: Optional[RGBTuple] = None
@@ -238,22 +298,22 @@ class WizAsyncController:
                 )
         scene_id = parser.get_scene_id()
         mac = parser.get_mac()
-        details.update(
-            {
-                "state": state,
-                "brightness": brightness,
-                "rgb": rgb_value,
-                "scene_id": scene_id,
-                "mac": mac,
-            }
+        return BulbStateUpdate(
+            state=state,
+            brightness=brightness,
+            rgb=rgb_value,
+            scene_id=scene_id,
+            mac=mac,
         )
-        return details
 
 
 class WizTUI:
     """Curses UI that lists bulbs and allows power control."""
 
-    def __init__(self, stdscr: "curses._CursesWindow", controller: WizAsyncController) -> None:
+    def __init__(self, stdscr: CursesWindow, controller: WizAsyncController) -> None:
+        if curses is None:
+            raise RuntimeError("curses module is not available")
+        self._curses = curses
         self.stdscr = stdscr
         self.controller = controller
         self.bulbs: List[BulbInfo] = []
@@ -263,80 +323,112 @@ class WizTUI:
         self.scene_list_index = 0
         self.group_mode = False
         self._init_default_attrs()
+        self._keymap: Dict[int, Callable[[], None]] = {}
+        self._init_key_bindings()
 
     def _init_default_attrs(self) -> None:
-        dim = getattr(curses, "A_DIM", curses.A_NORMAL)
-        self.attr_header = curses.A_REVERSE | curses.A_BOLD
-        self.attr_footer = curses.A_BOLD
-        self.attr_footer_info = curses.A_BOLD
-        self.attr_footer_error = curses.A_BOLD | curses.A_REVERSE
-        self.attr_row = curses.A_NORMAL
+        dim = getattr(self._curses, "A_DIM", self._curses.A_NORMAL)
+        self.attr_header = self._curses.A_REVERSE | self._curses.A_BOLD
+        self.attr_footer = self._curses.A_BOLD
+        self.attr_footer_info = self._curses.A_BOLD
+        self.attr_footer_error = self._curses.A_BOLD | self._curses.A_REVERSE
+        self.attr_row = self._curses.A_NORMAL
         self.attr_row_alt = dim
-        self.attr_row_on = curses.A_BOLD
+        self.attr_row_on = self._curses.A_BOLD
         self.attr_row_off = dim
-        self.attr_row_selected = curses.A_REVERSE | curses.A_BOLD
-        self.attr_scene_row = curses.A_NORMAL
-        self.attr_scene_selected = curses.A_REVERSE | curses.A_BOLD
+        self.attr_row_selected = self._curses.A_REVERSE | self._curses.A_BOLD
+        self.attr_scene_row = self._curses.A_NORMAL
+        self.attr_scene_selected = self._curses.A_REVERSE | self._curses.A_BOLD
         self.attr_scene_hint = dim
 
     def _init_colors(self) -> None:
-        if not curses.has_colors():
+        if not self._curses.has_colors():
             return
         try:
-            curses.start_color()
-        except curses.error:
+            self._curses.start_color()
+        except self._curses.error:
             return
-        with contextlib.suppress(curses.error):
-            curses.use_default_colors()
+        with contextlib.suppress(self._curses.error):
+            self._curses.use_default_colors()
 
         def init_pair(idx: int, fg: int, bg: int = -1) -> int:
             try:
-                curses.init_pair(idx, fg, bg)
-                return curses.color_pair(idx)
-            except curses.error:
+                self._curses.init_pair(idx, fg, bg)
+                return self._curses.color_pair(idx)
+            except self._curses.error:
                 return 0
 
-        header = init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        header = init_pair(1, self._curses.COLOR_BLACK, self._curses.COLOR_CYAN)
         if header:
-            self.attr_header = header | curses.A_BOLD
+            self.attr_header = header | self._curses.A_BOLD
 
-        footer = init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        footer = init_pair(2, self._curses.COLOR_WHITE, self._curses.COLOR_BLUE)
         if footer:
-            self.attr_footer = footer | curses.A_BOLD
+            self.attr_footer = footer | self._curses.A_BOLD
 
-        info = init_pair(3, curses.COLOR_GREEN, -1)
+        info = init_pair(3, self._curses.COLOR_GREEN, -1)
         if info:
-            self.attr_footer_info = info | curses.A_BOLD
+            self.attr_footer_info = info | self._curses.A_BOLD
 
-        error = init_pair(4, curses.COLOR_WHITE, curses.COLOR_RED)
+        error = init_pair(4, self._curses.COLOR_WHITE, self._curses.COLOR_RED)
         if error:
-            self.attr_footer_error = error | curses.A_BOLD
+            self.attr_footer_error = error | self._curses.A_BOLD
 
-        row = init_pair(5, curses.COLOR_WHITE, -1)
-        alt = init_pair(6, curses.COLOR_CYAN, -1)
-        selected = init_pair(7, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-        dim = getattr(curses, "A_DIM", curses.A_NORMAL)
+        row = init_pair(5, self._curses.COLOR_WHITE, -1)
+        alt = init_pair(6, self._curses.COLOR_CYAN, -1)
+        selected = init_pair(7, self._curses.COLOR_BLACK, self._curses.COLOR_YELLOW)
+        dim = getattr(self._curses, "A_DIM", self._curses.A_NORMAL)
         if row:
             self.attr_row = row
         if alt:
             self.attr_row_alt = alt | dim
         if selected:
-            self.attr_row_selected = selected | curses.A_BOLD
-            self.attr_scene_selected = selected | curses.A_BOLD
-            self.attr_row_on = curses.A_BOLD
+            self.attr_row_selected = selected | self._curses.A_BOLD
+            self.attr_scene_selected = selected | self._curses.A_BOLD
+            self.attr_row_on = self._curses.A_BOLD
             self.attr_row_off = dim
 
-        scene_row = init_pair(8, curses.COLOR_CYAN, -1)
+        scene_row = init_pair(8, self._curses.COLOR_CYAN, -1)
         if scene_row:
-            self.attr_scene_row = scene_row | curses.A_BOLD
-        hint = init_pair(9, curses.COLOR_MAGENTA, -1)
+            self.attr_scene_row = scene_row | self._curses.A_BOLD
+        hint = init_pair(9, self._curses.COLOR_MAGENTA, -1)
         if hint:
             self.attr_scene_hint = hint | dim
 
+    def _init_key_bindings(self) -> None:
+        def bind(keys: Tuple[int, ...], handler: Callable[[], None]) -> None:
+            for key in keys:
+                self._keymap[key] = handler
+
+        bind((self._curses.KEY_UP, ord("k")), lambda: self._move_selection(-1))
+        bind((self._curses.KEY_DOWN, ord("j")), lambda: self._move_selection(1))
+        bind((ord("r"), ord("R")), self.refresh_bulbs)
+        bind((ord(" "), ord("t"), ord("T")), self.toggle_selected)
+        bind((ord("o"), ord("O")), partial(self.set_selected, True))
+        bind((ord("f"), ord("F")), partial(self.set_selected, False))
+        bind((ord("s"), ord("S")), self.refresh_selected)
+        bind((ord("b"), ord("B")), self.adjust_brightness)
+        bind((ord("c"), ord("C")), self.set_rgb_color)
+        bind((ord("n"), ord("N")), self.apply_scene)
+        bind((ord("g"), ord("G")), self.toggle_group_mode)
+        bind((ord("l"), ord("L")), self.toggle_scene_list)
+
+    def _handle_key(self, key: int) -> bool:
+        if key == self._curses.ERR:
+            return True
+        if key in (ord("q"), 27):
+            return False
+        if self.show_scene_list and self._handle_scene_list_key(key):
+            return True
+        handler = self._keymap.get(key)
+        if handler:
+            handler()
+        return True
+
     def run(self) -> None:
         try:
-            curses.curs_set(0)
-        except curses.error:  # pragma: no cover - terminal dependent
+            self._curses.curs_set(0)
+        except self._curses.error:  # pragma: no cover - terminal dependent
             pass
         self.stdscr.nodelay(False)
         self.stdscr.keypad(True)
@@ -346,34 +438,8 @@ class WizTUI:
         while True:
             self.draw()
             key = self.stdscr.getch()
-            if key in (ord("q"), 27):
+            if not self._handle_key(key):
                 break
-            if self.show_scene_list and self._handle_scene_list_key(key):
-                continue
-            if key in (curses.KEY_UP, ord("k")):
-                self._move_selection(-1)
-            elif key in (curses.KEY_DOWN, ord("j")):
-                self._move_selection(1)
-            elif key in (ord("r"), ord("R")):
-                self.refresh_bulbs()
-            elif key in (ord(" "), ord("t"), ord("T")):
-                self.toggle_selected()
-            elif key in (ord("o"), ord("O")):
-                self.set_selected(True)
-            elif key in (ord("f"), ord("F")):
-                self.set_selected(False)
-            elif key in (ord("s"), ord("S")):
-                self.refresh_selected()
-            elif key in (ord("b"), ord("B")):
-                self.adjust_brightness()
-            elif key in (ord("c"), ord("C")):
-                self.set_rgb_color()
-            elif key in (ord("n"), ord("N")):
-                self.apply_scene()
-            elif key in (ord("g"), ord("G")):
-                self.toggle_group_mode()
-            elif key in (ord("l"), ord("L")):
-                self.toggle_scene_list()
 
     def refresh_bulbs(self, initial: bool = False) -> None:
         self.status_message = "Scanning for bulbs..."
@@ -612,7 +678,7 @@ class WizTUI:
         self._safe_add(height - 1, 0, footer, width, self._footer_attr())
         try:
             self.stdscr.refresh()
-        except curses.error:  # pragma: no cover - terminal dependent
+        except self._curses.error:  # pragma: no cover - terminal dependent
             pass
 
     def _handle_scene_list_key(self, key: int) -> bool:
@@ -622,16 +688,16 @@ class WizTUI:
         scene_items = self._scene_items()
         if not scene_items:
             return False
-        if key in (curses.KEY_UP, ord("k")):
+        if key in (self._curses.KEY_UP, ord("k")):
             self.scene_list_index = (self.scene_list_index - 1) % len(scene_items)
             self.status_message = self._scene_list_status()
             return True
-        if key in (curses.KEY_DOWN, ord("j")):
+        if key in (self._curses.KEY_DOWN, ord("j")):
             self.scene_list_index = (self.scene_list_index + 1) % len(scene_items)
             self.status_message = self._scene_list_status()
             return True
         if key in (
-            curses.KEY_ENTER,
+            self._curses.KEY_ENTER,
             ord("\n"),
             ord("\r"),
             ord("n"),
@@ -755,7 +821,7 @@ class WizTUI:
     def _apply_to_targets(
         self,
         targets: List[BulbInfo],
-        executor: Callable[[BulbInfo], Dict[str, Optional[Any]]],
+        executor: Callable[[BulbInfo], BulbStateUpdate],
     ) -> Tuple[int, List[Tuple[BulbInfo, str]]]:
         success = 0
         failures: List[Tuple[BulbInfo, str]] = []
@@ -765,10 +831,9 @@ class WizTUI:
             except Exception as exc:  # pragma: no cover - network dependent
                 failures.append((bulb, str(exc)))
                 continue
-            self._apply_result(bulb, result)
-            error = result.get("error")
-            if error:
-                failures.append((bulb, str(error)))
+            result.apply(bulb)
+            if result.error:
+                failures.append((bulb, str(result.error)))
             else:
                 success += 1
         return success, failures
@@ -793,7 +858,7 @@ class WizTUI:
             return
         try:
             self.stdscr.addnstr(y, x, text.ljust(width), width, attr)
-        except curses.error:  # pragma: no cover - terminal dependent
+        except self._curses.error:  # pragma: no cover - terminal dependent
             pass
 
     def _format_bulb_line(self, bulb: BulbInfo) -> str:
@@ -821,45 +886,27 @@ class WizTUI:
             parts.append("  ".join(details))
         return "  ".join(parts)
 
-    def _apply_result(self, bulb: BulbInfo, result: Dict[str, Optional[Any]]) -> None:
-        if result.get("state") is not None:
-            bulb.state = bool(result["state"])
-        if result.get("brightness") is not None:
-            bulb.brightness = int(result["brightness"])  # type: ignore[arg-type]
-        if result.get("rgb"):
-            rgb_val = result["rgb"]
-            bulb.rgb = (
-                int(rgb_val[0]),
-                int(rgb_val[1]),
-                int(rgb_val[2]),
-            )  # type: ignore[index]
-        if result.get("scene_id") is not None:
-            bulb.scene_id = int(result["scene_id"])  # type: ignore[arg-type]
-        if result.get("mac"):
-            bulb.mac = result["mac"]
-        bulb.last_error = result.get("error")
-
     def _prompt(self, prompt: str) -> Optional[str]:
         height, width = self.stdscr.getmaxyx()
         try:
             self.stdscr.move(height - 1, 0)
             self.stdscr.clrtoeol()
-        except curses.error:  # pragma: no cover - terminal dependent
+        except self._curses.error:  # pragma: no cover - terminal dependent
             pass
-        self._safe_add(height - 1, 0, prompt, width, curses.A_BOLD)
+        self._safe_add(height - 1, 0, prompt, width, self._curses.A_BOLD)
         try:
-            curses.echo()
+            self._curses.echo()
             self.stdscr.refresh()
-        except curses.error:  # pragma: no cover - terminal dependent
+        except self._curses.error:  # pragma: no cover - terminal dependent
             pass
         try:
             raw = self.stdscr.getstr(height - 1, len(prompt), max(1, width - len(prompt) - 1))
-        except curses.error:  # pragma: no cover - terminal dependent
+        except self._curses.error:  # pragma: no cover - terminal dependent
             raw = b""
         finally:
             try:
-                curses.noecho()
-            except curses.error:  # pragma: no cover - terminal dependent
+                self._curses.noecho()
+            except self._curses.error:  # pragma: no cover - terminal dependent
                 pass
         text = raw.decode(errors="ignore").strip()
         if not text:
@@ -935,11 +982,11 @@ def run_tui(broadcast_address: str = "255.255.255.255", wait_time: float = 5.0) 
     """Launch the wizlight TUI."""
 
     if curses is None:
-        raise RuntimeError(f"curses is required for the TUI: {_CURSES_IMPORT_ERROR}")
+        raise RuntimeError(f"curses is required for the TUI: {_curses_import_error}")
 
     controller = WizAsyncController(broadcast_address=broadcast_address, wait_time=wait_time)
 
-    def _wrapped(stdscr: "curses._CursesWindow") -> None:
+    def _wrapped(stdscr: CursesWindow) -> None:
         WizTUI(stdscr, controller).run()
 
     try:

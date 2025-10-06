@@ -12,11 +12,19 @@ class DiscoveredBulb:
     mac_address: str
 
 
+def _bulb_map_factory() -> Dict[str, DiscoveredBulb]:
+    """Create the mapping used to store bulbs by their MAC address."""
+
+    return {}
+
+
 @dataclasses.dataclass
 class BulbRegistry:
     """Representation of the bulb registry."""
 
-    bulbs_by_mac: Dict[str, DiscoveredBulb] = dataclasses.field(default_factory=dict)
+    bulbs_by_mac: Dict[str, DiscoveredBulb] = dataclasses.field(
+        default_factory=_bulb_map_factory
+    )
 
     def register(self, bulb: DiscoveredBulb) -> None:
         """Register a new bulb."""
